@@ -10,6 +10,23 @@ export interface LinkItem {
   url: string;
 }
 
+export type UploadedFileCategory = "document" | "audio" | "unknown";
+export type UploadedFileStatus = "uploaded" | "processing" | "ready" | "error";
+
+export interface UploadedFileRecord {
+  id: string;
+  originalName: string;
+  mimeType: string;
+  size: number;
+  storagePath: string;
+  uploadedAt: string;
+  category: UploadedFileCategory;
+  status: UploadedFileStatus;
+  summary?: string;
+  transcript?: string;
+  error?: string;
+}
+
 export type CardType = "project" | "entity" | "note" | "chart";
 
 export interface ProjectData {
@@ -67,6 +84,6 @@ export interface AgentState {
   planSteps: PlanStep[];
   currentStepIndex: number;
   planStatus: string;
+  uploads: UploadedFileRecord[];
 }
-
 

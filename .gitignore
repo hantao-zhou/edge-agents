@@ -50,3 +50,9 @@ bun.lockb
 
 # LangGraph API
 .langgraph_api
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Local file uploads (shared between UI & agent)
+shared_uploads/

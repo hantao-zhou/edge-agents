@@ -8,3 +8,5 @@ python-dotenv>=1.0.0,<2.0.0
 langgraph-cli[inmem]>=0.3.5
 langchain-openai>=0.0.1
 copilotkit>=0.1.0,<0.2.0
+pypdf>=5.1.0,<6.0.0
+faster-whisper>=1.0.3,<2.0.0

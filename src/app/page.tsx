@@ -13,12 +13,14 @@ import ShikiHighlighter from "react-shiki/web";
 import { motion, useScroll, useTransform, useMotionValueEvent } from "motion/react";
 import { EmptyState } from "@/components/empty-state";
 import { cn } from "@/lib/utils";
-import type { AgentState, PlanStep, Item, ItemData, ProjectData, EntityData, NoteData, ChartData, CardType } from "@/lib/canvas/types";
+import type { AgentState, PlanStep, Item, ItemData, ProjectData, EntityData, NoteData, ChartData, CardType, UploadedFileRecord, UploadedFileStatus } from "@/lib/canvas/types";
 import { initialState, isNonEmptyAgentState } from "@/lib/canvas/state";
 import { projectAddField4Item, projectSetField4ItemText, projectSetField4ItemDone, projectRemoveField4Item, chartAddField1Metric, chartSetField1Label, chartSetField1Value, chartRemoveField1Metric } from "@/lib/canvas/updates";
 import useMediaQuery from "@/hooks/use-media-query";
 import ItemHeader from "@/components/canvas/ItemHeader";
 import NewItemMenu from "@/components/canvas/NewItemMenu";
+import UploadsPanel from "@/components/uploads/UploadsPanel";
+import { toast } from "@/hooks/use-toast";
 
 export default function CopilotKitPage() {
   const { state, setState } = useCoAgent<AgentState>({
@@ -48,6 +50,22 @@ export default function CopilotKitPage() {
   const lastCreationRef = useRef<{ type: CardType; name: string; id: string; ts: number } | null>(null);
   const lastChecklistCreationRef = useRef<Record<string, { text: string; id: string; ts: number }>>({});
   const lastMetricCreationRef = useRef<Record<string, { label: string; value: number | ""; id: string; ts: number }>>({});
+  const [isUploading, setIsUploading] = useState(false);
+  const [busyFileIds, setBusyFileIds] = useState<Set<string>>(() => new Set());
+  const markBusyFile = useCallback((fileId: string) => {
+    setBusyFileIds((prev) => {
+      const next = new Set(prev);
+      next.add(fileId);
+      return next;
+    });
+  }, []);
+  const unmarkBusyFile = useCallback((fileId: string) => {
+    setBusyFileIds((prev) => {
+      const next = new Set(prev);
+      next.delete(fileId);
+      return next;
+    });
+  }, []);
   // Strong idempotency during plan execution: allow only one creation per type while plan runs
   const createdByTypeRef = useRef<Partial<Record<CardType, string>>>({});
   const prevPlanStatusRef = useRef<string | null>(null);
@@ -77,6 +95,110 @@ export default function CopilotKitPage() {
     console.log("[CoAgent state updated]", state);
   }, [state]);
 
+  const addUploadRecord = useCallback((record: UploadedFileRecord) => {
+    setState((prev) => {
+      const base = prev ?? initialState;
+      const uploads = base.uploads ?? [];
+      const deduped = uploads.filter((file) => file.id !== record.id);
+      return { ...base, uploads: [record, ...deduped] } as AgentState;
+    });
+  }, [setState]);
+
+  const patchUploadById = useCallback((fileId: string, patch: Partial<UploadedFileRecord>) => {
+    setState((prev) => {
+      const base = prev ?? initialState;
+      const uploads = (base.uploads ?? []).map((file) => (file.id === fileId ? { ...file, ...patch } : file));
+      return { ...base, uploads } as AgentState;
+    });
+  }, [setState]);
+
+  const removeUploadById = useCallback((fileId: string) => {
+    setState((prev) => {
+      const base = prev ?? initialState;
+      const uploads = (base.uploads ?? []).filter((file) => file.id !== fileId);
+      return { ...base, uploads } as AgentState;
+    });
+  }, [setState]);
+
+  const handleFilesSelected = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setIsUploading(true);
+    const selected = Array.from(files);
+    try {
+      for (const file of selected) {
+        try {
+          const data = new FormData();
+          data.set("file", file);
+          const response = await fetch("/api/uploads", {
+            method: "POST",
+            body: data,
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || !payload?.file) {
+            throw new Error(payload?.error || "Unable to upload file");
+          }
+          const serverFile = payload.file;
+          const normalized: UploadedFileRecord = {
+            id: serverFile.id,
+            originalName: serverFile.originalName ?? file.name ?? "upload",
+            mimeType: serverFile.mimeType ?? file.type ?? "application/octet-stream",
+            size: typeof serverFile.size === "number" ? serverFile.size : file.size,
+            storagePath: serverFile.storagePath,
+            uploadedAt: serverFile.uploadedAt ?? new Date().toISOString(),
+            category: serverFile.category ?? "unknown",
+            status: "uploaded",
+            summary: typeof serverFile.summary === "string" && serverFile.summary.length > 0 ? serverFile.summary : undefined,
+            transcript: typeof serverFile.transcript === "string" && serverFile.transcript.length > 0 ? serverFile.transcript : undefined,
+            error: undefined,
+          };
+          addUploadRecord(normalized);
+          toast({
+            title: "File uploaded",
+            description: normalized.originalName,
+          });
+        } catch (error) {
+          console.error("[upload] failed", error);
+          toast({
+            title: "Upload failed",
+            description: error instanceof Error ? error.message : "Unexpected error during upload",
+            variant: "destructive",
+          });
+        }
+      }
+    } finally {
+      setIsUploading(false);
+    }
+  }, [addUploadRecord]);
+
+  const handleRemoveUpload = useCallback(async (file: UploadedFileRecord) => {
+    markBusyFile(file.id);
+    try {
+      const response = await fetch("/api/uploads", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ storagePath: file.storagePath }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload?.error || "Unable to delete file");
+      }
+      removeUploadById(file.id);
+      toast({
+        title: "File removed",
+        description: file.originalName,
+      });
+    } catch (error) {
+      console.error("[upload] delete failed", error);
+      toast({
+        title: "Delete failed",
+        description: error instanceof Error ? error.message : "Unable to delete file",
+        variant: "destructive",
+      });
+    } finally {
+      unmarkBusyFile(file.id);
+    }
+  }, [markBusyFile, removeUploadById, unmarkBusyFile]);
+
   // Reset JSON view when there are no items
   useEffect(() => {
     const itemsCount = (viewState?.items ?? []).length;
@@ -89,6 +211,7 @@ export default function CopilotKitPage() {
   const planStepsMemo = (viewState?.planSteps ?? initialState.planSteps) as PlanStep[];
   const planStatusMemo = viewState?.planStatus ?? initialState.planStatus;
   const currentStepIndexMemo = typeof viewState?.currentStepIndex === "number" ? viewState.currentStepIndex : initialState.currentStepIndex;
+  const uploadEntries = (viewState?.uploads ?? initialState.uploads) as UploadedFileRecord[];
 
   // One-time final summary renderer in chat when plan completes or fails
   useCoAgentStateRender<AgentState>({
@@ -142,11 +265,22 @@ export default function CopilotKitPage() {
 
   const getStatePreviewJSON = (s: AgentState | undefined): Record<string, unknown> => {
     const snapshot = (s ?? initialState) as AgentState;
-    const { globalTitle, globalDescription, items } = snapshot;
+    const { globalTitle, globalDescription, items, uploads } = snapshot;
     return {
       globalTitle: globalTitle ?? initialState.globalTitle,
       globalDescription: globalDescription ?? initialState.globalDescription,
       items: items ?? initialState.items,
+      uploads: (uploads ?? initialState.uploads).map((file) => ({
+        id: file.id,
+        originalName: file.originalName,
+        category: file.category,
+        status: file.status,
+        storagePath: file.storagePath,
+        summary: file.summary,
+        transcript: file.transcript
+          ? `${file.transcript.slice(0, 200)}${file.transcript.length > 200 ? "…" : ""}`
+          : undefined,
+      })),
     };
   };
 
@@ -179,6 +313,11 @@ export default function CopilotKitPage() {
         "- chart.data:",
         "  - field1: Array<{id: string, label: string, value: number | ''}> with value in [0..100] or ''",
       ].join("\n");
+      const uploads = viewState.uploads ?? initialState.uploads;
+      const uploadsSummary = uploads
+        .slice(0, 5)
+        .map((file) => `id=${file.id} • name=${file.originalName} • category=${file.category} • status=${file.status} • path=${file.storagePath}`)
+        .join("\n");
       const toolUsageHints = [
         "TOOL USAGE HINTS:",
         "- Prefer calling specific actions: setProjectField1, setProjectField2, setProjectField3, addProjectChecklistItem, setProjectChecklistItem, removeProjectChecklistItem.",
@@ -191,6 +330,14 @@ export default function CopilotKitPage() {
         "RANDOMIZATION: If the user specifically asks for random/mock values, you MAY generate and set them right away using the tools (do not block for more details).",
         "VERIFICATION: After tools run, re-read the latest state and confirm what actually changed.",
       ].join("\n");
+      const uploadGuidance = [
+        "UPLOAD STATE:",
+        uploadsSummary || "(no files uploaded)",
+        "UPLOAD TOOLING:",
+        "- To read/summarize a document, call analyze_uploaded_document with storagePath plus either a question or desired summary focus.",
+        "- To work with audio, call transcribe_uploaded_audio with storagePath (and optionally language). This returns text you can quote or summarize.",
+        "- Keep statuses in sync via setUploadedFileStatus (uploaded | processing | ready | error). Use setUploadedFileSummary / setUploadedFileTranscript to persist insights.",
+      ].join("\n");
       return [
         "ALWAYS ANSWER FROM SHARED STATE (GROUND TRUTH).",
         "If a command does not specify which item to change, ask the user to clarify before proceeding.",
@@ -200,6 +347,7 @@ export default function CopilotKitPage() {
         summary || "(none)",
         fieldSchema,
         toolUsageHints,
+        uploadGuidance,
       ].join("\n");
     })(),
   });
@@ -432,6 +580,63 @@ export default function CopilotKitPage() {
 
 
   // Frontend Actions (exposed as tools to the agent via CopilotKit)
+  useCopilotAction({
+    name: "setUploadedFileSummary",
+    description: "Store a summary or notes for an uploaded file so future turns can reference it.",
+    available: "remote",
+    parameters: [
+      { name: "fileId", type: "string", required: true, description: "The uploaded file id." },
+      { name: "summary", type: "string", required: true, description: "Summary or notes to store." },
+    ],
+    handler: ({ fileId, summary }: { fileId: string; summary: string }) => {
+      patchUploadById(fileId, { summary, status: "ready" });
+    },
+  });
+
+  useCopilotAction({
+    name: "setUploadedFileTranscript",
+    description: "Attach transcript text produced for an uploaded audio file.",
+    available: "remote",
+    parameters: [
+      { name: "fileId", type: "string", required: true, description: "The uploaded file id." },
+      { name: "transcript", type: "string", required: true, description: "Transcript text to store." },
+    ],
+    handler: ({ fileId, transcript }: { fileId: string; transcript: string }) => {
+      patchUploadById(fileId, { transcript, status: "ready" });
+    },
+  });
+
+  useCopilotAction({
+    name: "setUploadedFileStatus",
+    description: "Update the processing status for an uploaded file (uploaded | processing | ready | error).",
+    available: "remote",
+    parameters: [
+      { name: "fileId", type: "string", required: true, description: "The uploaded file id." },
+      { name: "status", type: "string", required: true, description: "uploaded | processing | ready | error" },
+      { name: "error", type: "string", required: false, description: "Optional error description if status is error." },
+    ],
+    handler: ({ fileId, status, error }: { fileId: string; status: string; error?: string }) => {
+      const allowed: UploadedFileStatus[] = ["uploaded", "processing", "ready", "error"];
+      const normalized = allowed.includes(status as UploadedFileStatus) ? (status as UploadedFileStatus) : "uploaded";
+      patchUploadById(fileId, {
+        status: normalized,
+        error: normalized === "error" ? (error ?? "Unknown error") : undefined,
+      });
+    },
+  });
+
+  useCopilotAction({
+    name: "removeUploadedFile",
+    description: "Remove an uploaded file entry from the shared state (does not delete the physical file).",
+    available: "remote",
+    parameters: [
+      { name: "fileId", type: "string", required: true, description: "The uploaded file id." },
+    ],
+    handler: ({ fileId }: { fileId: string }) => {
+      removeUploadById(fileId);
+    },
+  });
+
   useCopilotAction({
     name: "setGlobalTitle",
     description: "Set the global title/name (outside of items).",
@@ -1131,6 +1336,14 @@ export default function CopilotKitPage() {
                   />
                 </motion.div>
               )}
+
+              <UploadsPanel
+                uploads={uploadEntries}
+                isUploading={isUploading}
+                busyFileIds={busyFileIds}
+                onSelectFiles={handleFilesSelected}
+                onRemoveFile={handleRemoveUpload}
+              />
               
               {(viewState.items ?? []).length === 0 ? (
                 <EmptyState className="flex-1">
@@ -1250,4 +1463,3 @@ export default function CopilotKitPage() {
     </div>
   );
 }
-

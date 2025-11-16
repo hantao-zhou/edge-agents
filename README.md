@@ -24,6 +24,7 @@ This is a starter template for building AI-powered canvas applications using [La
 - **Human-in-the-Loop (HITL)**: Intelligent interrupts for clarification when needed
 - **JSON View**: Toggle between visual canvas and raw JSON state
 - **Responsive Design**: Optimized for both desktop (sidebar chat) and mobile (popup chat)
+- **Document & Audio Uploads**: Drop PDFs/text/audio files into the canvas so the agent can summarize documents or transcribe audio directly via backend tools
 
 ## Prerequisites
 
@@ -83,6 +84,16 @@ Once the application is running, you can:
    - The AI will create a plan and execute it step by step with visual progress
 
 4. **View JSON**: Toggle between the visual canvas and JSON view using the button at the bottom
+
+## Working with Uploaded Files
+
+1. **Upload Assets**: Use the "Uploaded files" panel at the top of the canvas to drag & drop PDFs, text files, Markdown, CSVs, or common audio formats (MP3, WAV, M4A, FLAC).
+2. **Shared Storage**: All files land in the `shared_uploads/` folder (configurable via the `SHARED_UPLOAD_DIR` env). This folder is gitignored so data stays local.
+3. **Agent Actions**:
+   - Documents: the model calls the `analyze_uploaded_document` backend tool to extract text snippets for summarization or Q&A.
+   - Audio: the model calls `transcribe_uploaded_audio`, powered by `faster-whisper`, to produce transcripts it can summarize or quote.
+4. **State Sync**: The frontend exposes `setUploadedFileSummary`, `setUploadedFileTranscript`, `setUploadedFileStatus`, and `removeUploadedFile` actions so the agent can store insights/transcripts that persist across turns.
+5. **Configuration**: Tune transcription performance with `WHISPER_MODEL_SIZE`, `WHISPER_DEVICE`, and `WHISPER_COMPUTE_TYPE` inside `agent/.env`.
 
 ## Available Scripts
 The following scripts can also be run using your preferred package manager:

@@ -29,6 +29,9 @@ if 'langgraph.graph.graph' not in sys.modules:
     sys.modules['langgraph.graph.graph'] = _mock_graph_module
 
 # Now we can safely import everything else
+import os
+from pathlib import Path
+from functools import lru_cache
 from typing import Any, List, Optional, Dict
 from typing_extensions import Literal
 from langchain_openai import ChatOpenAI
@@ -40,6 +43,31 @@ from langgraph.types import Command
 from copilotkit import CopilotKitState
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
+
+# Some environments inject SOCKS proxies that httpx (used by ChatOpenAI) can't parse.
+# Clear them explicitly so the llama.cpp client talks to the local server directly.
+for _proxy_var in [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+]:
+    os.environ.pop(_proxy_var, None)
+
+LLAMA_CPP_BASE_URL = (
+    os.getenv("LLAMA_CPP_SERVER_URL")
+    or os.getenv("OPENAI_API_BASE")
+    or "http://localhost:8080/v1"
+).rstrip("/")
+LLAMA_CPP_MODEL = os.getenv("LLAMA_CPP_MODEL") or os.getenv("OPENAI_MODEL_NAME") or "qwen3"
+LLAMA_CPP_API_KEY = os.getenv("LLAMA_CPP_API_KEY") or os.getenv("OPENAI_API_KEY") or "llama.cpp-placeholder-key"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+UPLOAD_ROOT = Path(os.getenv("SHARED_UPLOAD_DIR") or (PROJECT_ROOT / "shared_uploads")).resolve()
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 class AgentState(CopilotKitState):
     """
@@ -60,6 +88,7 @@ class AgentState(CopilotKitState):
     planSteps: List[Dict[str, Any]] = []
     currentStepIndex: int = -1
     planStatus: str = ""
+    uploads: List[Dict[str, Any]] = []
 def summarize_items_for_prompt(state: AgentState) -> str:
     try:
         items = state.get("items", []) or []
@@ -99,6 +128,103 @@ def summarize_items_for_prompt(state: AgentState) -> str:
     except Exception:
         return "(unable to summarize items)"
 
+def summarize_uploads_for_prompt(state: AgentState) -> str:
+    try:
+        uploads = state.get("uploads", []) or []
+        lines: List[str] = []
+        for entry in uploads:
+            fid = str(entry.get("id", ""))
+            name = entry.get("originalName") or entry.get("name") or entry.get("filename") or ""
+            category = entry.get("category") or "unknown"
+            status = entry.get("status") or ""
+            storage_path = entry.get("storagePath") or entry.get("path") or ""
+            preview = ""
+            summary = entry.get("summary") or ""
+            transcript = entry.get("transcript") or ""
+            if summary:
+                preview = f"summary={str(summary)[:80]}"
+            elif transcript:
+                preview = f"transcript_preview={str(transcript)[:80]}"
+            lines.append(
+                f"id={fid} · name={name} · type={category} · status={status} · path={storage_path} · {preview}".strip()
+            )
+        return "\n".join(lines) if lines else "(no uploads)"
+    except Exception:
+        return "(unable to summarize uploads)"
+
+def persistable_state_fields(state: AgentState) -> Dict[str, Any]:
+    return {
+        "items": state.get("items", []),
+        "globalTitle": state.get("globalTitle", ""),
+        "globalDescription": state.get("globalDescription", ""),
+        "itemsCreated": state.get("itemsCreated", 0),
+        "lastAction": state.get("lastAction", ""),
+        "planSteps": state.get("planSteps", []),
+        "currentStepIndex": state.get("currentStepIndex", -1),
+        "planStatus": state.get("planStatus", ""),
+        "uploads": state.get("uploads", []),
+    }
+
+def resolve_uploaded_path(storage_path: str) -> Path:
+    if not storage_path or not isinstance(storage_path, str):
+        raise ValueError("storage_path is required to locate an uploaded file.")
+    candidate = Path(storage_path)
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / storage_path).resolve()
+    else:
+        candidate = candidate.resolve()
+    upload_root = str(UPLOAD_ROOT)
+    if not str(candidate).startswith(upload_root):
+        raise ValueError(f"Path {candidate} is outside of the uploads directory {upload_root}")
+    if not candidate.exists():
+        raise FileNotFoundError(f"Uploaded file not found at {candidate}")
+    return candidate
+
+def _read_text_with_fallback(path: Path) -> str:
+    encodings = ["utf-8", "utf-16", "latin-1"]
+    for enc in encodings:
+        try:
+            return path.read_text(encoding=enc, errors="ignore")
+        except Exception:
+            continue
+    with path.open("rb") as handle:
+        data = handle.read()
+    return data.decode("utf-8", errors="ignore")
+
+def extract_document_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".md", ".markdown", ".csv", ".json", ".log"}:
+        return _read_text_with_fallback(path)
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise RuntimeError("pypdf is required to read PDF files. Please install pypdf.") from exc
+        reader = PdfReader(str(path))
+        pages: List[str] = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text:
+                pages.append(text)
+        return "\n".join(pages)
+    raise ValueError(f"Unsupported document type: {suffix}")
+
+@lru_cache(maxsize=1)
+def _get_whisper_model():
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "faster-whisper is required for audio transcription. Please install faster-whisper."
+        ) from exc
+    model_size = os.getenv("WHISPER_MODEL_SIZE", "small")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    return WhisperModel(model_size, device=device, compute_type=compute_type)
+
 
 @tool
 def set_plan(steps: List[str]):
@@ -121,6 +247,80 @@ def complete_plan():
     """
     return {"completed": True}
 
+@tool
+def analyze_uploaded_document(storage_path: str, instruction: str = "Summarize the document", max_characters: int = 4000):
+    """
+    Load an uploaded document (txt, md, csv, json, pdf) and return extracted text for the model to reason over.
+
+    Args:
+        storage_path: Relative path to the uploaded file (as shown in uploadsState).
+        instruction: What the analysis should focus on (summary, question, etc.).
+        max_characters: Limit the returned text to this many characters.
+    """
+    try:
+        target = resolve_uploaded_path(storage_path)
+        text = extract_document_text(target)
+    except Exception as exc:
+        return f"FAILED_TO_LOAD_DOCUMENT: {exc}"
+    cleaned = (text or "").replace("\x00", " ").strip()
+    if not cleaned:
+        return f"DOCUMENT_EMPTY: No extractable text found in {target.name}"
+    try:
+        limit = int(max_characters)
+    except Exception:
+        limit = 4000
+    limit = max(500, min(limit, 16000))
+    excerpt = cleaned[:limit]
+    truncated_note = ""
+    if len(cleaned) > len(excerpt):
+        truncated_note = f"\n[Excerpt truncated to {len(excerpt)} of {len(cleaned)} characters]"
+    focus = instruction or "Summarize the document"
+    return (
+        f"DOCUMENT PATH: {target}\n"
+        f"INSTRUCTION: {focus}\n"
+        f"EXTRACTED TEXT:\n{excerpt}{truncated_note}"
+    )
+
+@tool
+def transcribe_uploaded_audio(storage_path: str, task: Literal["transcribe", "translate"] = "transcribe", language: Optional[str] = None):
+    """
+    Transcribe an uploaded audio file using faster-whisper.
+
+    Args:
+        storage_path: Relative path to the uploaded audio file.
+        task: 'transcribe' (default) to keep original language or 'translate' to translate to English.
+        language: Optional language code to bias transcription (e.g., 'en', 'es').
+    """
+    try:
+        target = resolve_uploaded_path(storage_path)
+    except Exception as exc:
+        return f"FAILED_TO_LOCATE_AUDIO: {exc}"
+    try:
+        model = _get_whisper_model()
+        segments, info = model.transcribe(str(target), task=task, language=language or None, beam_size=5)
+        lines: List[str] = []
+        for segment in segments:
+            seg_text = getattr(segment, "text", "").strip()
+            if not seg_text:
+                continue
+            start = getattr(segment, "start", 0.0)
+            end = getattr(segment, "end", 0.0)
+            lines.append(f"[{start:0.02f}-{end:0.02f}] {seg_text}")
+        transcript = "\n".join(lines).strip()
+        if not transcript:
+            return f"TRANSCRIPTION_EMPTY: No speech detected in {target.name}"
+        metadata = ""
+        if info:
+            detected_lang = getattr(info, "language", None)
+            duration = getattr(info, "duration", None)
+            metadata = f"duration={duration:.2f}s" if isinstance(duration, (int, float)) else ""
+            if detected_lang:
+                metadata = f"{metadata} language={detected_lang}" if metadata else f"language={detected_lang}"
+        header = f"TRANSCRIPTION ({metadata})" if metadata else "TRANSCRIPTION"
+        return f"{header}:\n{transcript}"
+    except Exception as exc:
+        return f"FAILED_TO_TRANSCRIBE: {exc}"
+
 # @tool
 # def your_tool_here(your_arg: str):
 #     """Your tool description here."""
@@ -131,6 +331,8 @@ backend_tools = [
     set_plan,
     update_plan_progress,
     complete_plan,
+    analyze_uploaded_document,
+    transcribe_uploaded_audio,
 ]
 
 # Extract tool names from backend_tools for comparison
@@ -143,6 +345,10 @@ FRONTEND_TOOL_ALLOWLIST = set([
     "setItemName",
     "setItemSubtitleOrDescription",
     "setItemDescription",
+    "setUploadedFileSummary",
+    "setUploadedFileTranscript",
+    "setUploadedFileStatus",
+    "removeUploadedFile",
     # note
     "setNoteField1",
     "appendNoteField1",
@@ -185,8 +391,12 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
     https://www.perplexity.ai/search/react-agents-NcXLQhreS0WDzpVaS4m9Cg
     """
 
-    # 1. Define the model
-    model = ChatOpenAI(model="gpt-4o")
+    # 1. Define the model (llama.cpp OpenAI-compatible server)
+    model = ChatOpenAI(
+        model=LLAMA_CPP_MODEL,
+        base_url=LLAMA_CPP_BASE_URL,
+        api_key=LLAMA_CPP_API_KEY,
+    )
 
     # 2. Prepare and bind tools to the model (dedupe, allowlist, and cap)
     def _extract_tool_name(tool: Any) -> Optional[str]:
@@ -245,6 +455,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
 
     # 3. Define the system message by which the chat model will be run
     items_summary = summarize_items_for_prompt(state)
+    uploads_summary = summarize_uploads_for_prompt(state)
     global_title = state.get("globalTitle", "")
     global_description = state.get("globalDescription", "")
     post_tool_guidance = state.get("__last_tool_guidance", None)
@@ -252,6 +463,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
     plan_steps = state.get("planSteps", []) or []
     current_step_index = state.get("currentStepIndex", -1)
     plan_status = state.get("planStatus", "")
+    shared_state = persistable_state_fields(state)
     field_schema = (
         "FIELD SCHEMA (authoritative):\n"
         "- project.data:\n"
@@ -282,18 +494,28 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         "4) After a successful mutation (create/update/delete), summarize changes and STOP instead of looping.\n"
         "5) If lastAction starts with 'created:', DO NOT call createItem again unless the user explicitly asks to create another item.\n"
     )
+    upload_handling = (
+        "UPLOAD HANDLING:\n"
+        "1) Uploaded files appear in uploadsState with id, name, status, category, and storagePath.\n"
+        "2) To inspect a document, call analyze_uploaded_document(storage_path=\"<path>\", instruction=\"focus area\").\n"
+        "3) To work with audio, call transcribe_uploaded_audio(storage_path=\"<path>\", language=\"<code>\").\n"
+        "4) After processing, keep status synced via setUploadedFileStatus and persist outputs via setUploadedFileSummary / setUploadedFileTranscript.\n"
+        "5) Never assume document/audio contents without running the relevant backend tool.\n"
+    )
 
     system_message = SystemMessage(
         content=(
             f"globalTitle (ground truth): {global_title}\n"
             f"globalDescription (ground truth): {global_description}\n"
             f"itemsState (ground truth):\n{items_summary}\n"
+            f"uploadsState (ground truth):\n{uploads_summary}\n"
             f"lastAction (ground truth): {last_action}\n"
             f"planStatus (ground truth): {plan_status}\n"
             f"currentStepIndex (ground truth): {current_step_index}\n"
             f"planSteps (ground truth): {[s.get('title', s) for s in plan_steps]}\n"
             f"{loop_control}\n"
             f"{field_schema}\n"
+            f"{upload_handling}\n"
             "RANDOMIZATION POLICY:\n"
             "- If the user explicitly requests random/mock/placeholder values, generate plausible values consistent with the FIELD SCHEMA.\n"
             "  Examples: field2 randomly from {'Option A','Option B','Option C'}; field3 as a random future date within 365 days;\n"
@@ -381,14 +603,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
                         goto=END,
                         update={
                             # no changes; just wait for the client to respond with ToolMessage(s)
-                            "items": state.get("items", []),
-                            "globalTitle": state.get("globalTitle", ""),
-                            "globalDescription": state.get("globalDescription", ""),
-                            "itemsCreated": state.get("itemsCreated", 0),
-                            "lastAction": state.get("lastAction", ""),
-                            "planSteps": state.get("planSteps", []),
-                            "currentStepIndex": state.get("currentStepIndex", -1),
-                            "planStatus": state.get("planStatus", ""),
+                            **shared_state,
                         },
                     )
     except Exception:
@@ -409,6 +624,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
             f"- globalTitle: {global_title!s}\n"
             f"- globalDescription: {global_description!s}\n"
             f"- items:\n{items_summary}\n"
+            f"- uploads:\n{uploads_summary}\n"
             f"- lastAction: {last_action}\n\n"
             f"- planStatus: {plan_status}\n"
             f"- currentStepIndex: {current_step_index}\n"
@@ -518,14 +734,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
             update={
                 "messages": [response],
                 # persist shared state keys so UI edits survive across runs
-                "items": state.get("items", []),
-                "globalTitle": state.get("globalTitle", ""),
-                "globalDescription": state.get("globalDescription", ""),
-                "itemsCreated": state.get("itemsCreated", 0),
-                "lastAction": state.get("lastAction", ""),
-                "planSteps": state.get("planSteps", []),
-                "currentStepIndex": state.get("currentStepIndex", -1),
-                "planStatus": state.get("planStatus", ""),
+                **shared_state,
                 **plan_updates,
                 # guidance for follow-up after tool execution
                 "__last_tool_guidance": "If a deletion tool reports success (deleted:ID), acknowledge deletion even if the item no longer exists afterwards."
@@ -563,14 +772,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
             goto=END,
             update={
                 "messages": [response],
-                "items": state.get("items", []),
-                "globalTitle": state.get("globalTitle", ""),
-                "globalDescription": state.get("globalDescription", ""),
-                "itemsCreated": state.get("itemsCreated", 0),
-                "lastAction": state.get("lastAction", ""),
-                "planSteps": state.get("planSteps", []),
-                "currentStepIndex": state.get("currentStepIndex", -1),
-                "planStatus": state.get("planStatus", ""),
+                **shared_state,
                 **plan_updates,
                 "__last_tool_guidance": (
                     "Frontend tool calls issued. Waiting for client tool results before continuing."
@@ -586,14 +788,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
                 # At this point there should be no frontend tool calls; ensure we don't pass any unresolved ones back to the model
                 "messages": ([]),
                 # persist shared state keys so UI edits survive across runs
-                "items": state.get("items", []),
-                "globalTitle": state.get("globalTitle", ""),
-                "globalDescription": state.get("globalDescription", ""),
-                "itemsCreated": state.get("itemsCreated", 0),
-                "lastAction": state.get("lastAction", ""),
-                "planSteps": state.get("planSteps", []),
-                "currentStepIndex": state.get("currentStepIndex", -1),
-                "planStatus": state.get("planStatus", ""),
+                **shared_state,
                 **plan_updates,
                 "__last_tool_guidance": (
                     "Plan is in progress. Proceed to the next step automatically. "
@@ -616,14 +811,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
             update={
                 "messages": [response] if has_frontend_tool_calls else ([]),
                 # persist shared state keys so UI edits survive across runs
-                "items": state.get("items", []),
-                "globalTitle": state.get("globalTitle", ""),
-                "globalDescription": state.get("globalDescription", ""),
-                "itemsCreated": state.get("itemsCreated", 0),
-                "lastAction": state.get("lastAction", ""),
-                "planSteps": state.get("planSteps", []),
-                "currentStepIndex": state.get("currentStepIndex", -1),
-                "planStatus": state.get("planStatus", ""),
+                **shared_state,
                 **plan_updates,
                 "__last_tool_guidance": (
                     "All steps are completed. Call complete_plan to mark the plan as finished, "
@@ -640,14 +828,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         update={
             "messages": final_messages,
             # persist shared state keys so UI edits survive across runs
-            "items": state.get("items", []),
-            "globalTitle": state.get("globalTitle", ""),
-            "globalDescription": state.get("globalDescription", ""),
-            "itemsCreated": state.get("itemsCreated", 0),
-            "lastAction": state.get("lastAction", ""),
-            "planSteps": state.get("planSteps", []),
-            "currentStepIndex": state.get("currentStepIndex", -1),
-            "planStatus": state.get("planStatus", ""),
+            **shared_state,
             **plan_updates,
             "__last_tool_guidance": None,
         }

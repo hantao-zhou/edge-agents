@@ -9,6 +9,7 @@ export const initialState: AgentState = {
   planSteps: [],
   currentStepIndex: -1,
   planStatus: "",
+  uploads: [],
 };
 
 export function isNonEmptyAgentState(value: unknown): value is AgentState {
@@ -42,5 +43,4 @@ export function defaultDataFor(type: CardType): ItemData {
       return { field1: "" } as NoteData;
   }
 }
-
 
